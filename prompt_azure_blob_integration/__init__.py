@@ -1,7 +1,7 @@
 __version__ = "0.0.1"
 import frappe
 from frappe.core.doctype.file.file import File
-from frappe.handler import User, optimize_image, upload_file as core_upload_file
+from frappe.handler import optimize_image, upload_file as core_upload_file
 
 import os
 import shutil
