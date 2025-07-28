@@ -1,7 +1,7 @@
 __version__ = "0.0.1"
 import frappe
 from frappe.core.doctype.file.file import File
-from frappe.handler import optimize_image, upload_file as core_upload_file
+from frappe.handler import User, optimize_image, upload_file as core_upload_file
 
 import os
 import shutil
@@ -10,7 +10,7 @@ from urllib.parse import urlparse
 from azure.storage.blob import BlobServiceClient
 from frappe import _
 from frappe.utils import cint
-from frappe.core.doctype.file.utils import update_existing_file_docs   #  FIXED
+from frappe.core.doctype.file.utils import update_existing_file_docs   # FIXED
 from frappe.handler import check_write_permission, ALLOWED_MIMETYPES, is_whitelisted
 from mimetypes import guess_type
 
