@@ -13,21 +13,19 @@ from frappe.utils import cint
 from frappe.core.doctype.file.utils import update_existing_file_docs   # FIXED
 from frappe.handler import check_write_permission, ALLOWED_MIMETYPES, is_whitelisted
 from mimetypes import guess_type
+from datetime import datetime
 
-
-# -------------------------
-# 1. Override handle_is_private_changed
-# -------------------------
+# ? Override handle_is_private_changed
 def custom_handle_is_private_changed(self):
     from pathlib import Path
     from azure.storage.blob import BlobServiceClient
     from urllib.parse import urlparse
 
-    # Allow Azure-managed files even though they are remote
+    # ? Allow Azure-managed files even though they are remote
     if self.is_remote_file and "blob.core.windows.net" not in (self.file_url or ""):
         return
 
-    # Fetch Azure Settings
+    # ? Fetch Azure Settings
     azure_settings = frappe.get_single("Azure File Upload Settings")
     enable_azure = azure_settings.enable
     connection_string = azure_settings.connection_string
@@ -37,21 +35,25 @@ def custom_handle_is_private_changed(self):
     old_file_url = self.file_url
     file_name = self.file_url.split("/")[-1]
 
-    # --- CASE 1: File is in Azure ---
+    # ? CASE 1: FILE IS IN AZURE
     if old_file_url and "blob.core.windows.net" in old_file_url:
+
+        # ? IF NOR ENABLE AZURE, THROW ERROR
         if not enable_azure:
             frappe.throw(_("Azure Storage is disabled. Cannot change privacy of Azure files."))
 
         try:
-            # Parse container from old URL
+            # ? PARSE CONTAINER FROM OLD URL
             parsed_url = urlparse(old_file_url)
             path_parts = parsed_url.path.strip("/").split("/")
-            current_container = path_parts[0]  # Extract current container from URL
 
-            # Initialize Azure Client
+            # ? EXTRACT CURRENT CONTAINER FROM URL
+            current_container = path_parts[0]
+
+            # ? Initialize Azure Client
             blob_service_client = BlobServiceClient.from_connection_string(connection_string)
 
-            # Determine source and destination containers
+            # ? DETERMINE SOURCE AND DESTINATION CONTAINERS
             if cint(self.is_private):
                 source_container = public_container
                 target_container = private_container
@@ -59,29 +61,29 @@ def custom_handle_is_private_changed(self):
                 source_container = private_container
                 target_container = public_container
 
-            # Validate if source matches current container (safety check)
+            # ? VALIDATE IS SOURCE MATCHES CURRENT CONTAINER (SAFETY CHECK)
             if current_container != source_container:
                 frappe.throw(_("Azure container mismatch! Expected {0} but found {1}").format(source_container, current_container))
 
-            # Copy Blob to target container
+            # ? COPY BLOB TO TARGET CONTAINER
             source_blob = blob_service_client.get_blob_client(container=source_container, blob=self.file_name)
             target_blob = blob_service_client.get_blob_client(container=target_container, blob=self.file_name)
 
-            # Start copy
+            # ? START COPY
             target_blob.start_copy_from_url(source_blob.url)
 
-            # Wait until copy completes (polling status)
+            # ? WAIT UNTIL COPY COMPLETES (POLLING STATUS)
             props = target_blob.get_blob_properties()
             while props.copy.status == "pending":
                 props = target_blob.get_blob_properties()
 
-            # Delete original blob
+            # ? DELETE ORIGINAL BLOB
             source_blob.delete_blob()
 
-            # Update file_url to new container URL
+            # ? UPDATE file_url TO NEW CONTAINER URL
             self.file_url = target_blob.url
 
-            # Update references in attached doctypes
+            # ? UPDATE REFERENCE IN ATTACHED DOCTYPES
             update_existing_file_docs(self)
 
             if (
@@ -106,7 +108,7 @@ def custom_handle_is_private_changed(self):
         except Exception as e:
             frappe.throw(f"Failed to move file in Azure Storage: {str(e)}")
 
-    # --- CASE 2: Local File Handling (original untouched logic) ---
+    # ? CASE 2: LOCAL FILE HANDELING (ORIGINAL UNTOUCHED LOGIC)
     else:
         if self.is_remote_file:
             return
@@ -129,7 +131,7 @@ def custom_handle_is_private_changed(self):
             url_starts_with = "/files/"
         updated_file_url = f"{url_starts_with}{file_name}"
 
-        # Avoid unnecessary move
+        # ? AVOID UNNECESSARY MOVES
         if updated_file_url == old_file_url:
             return
 
@@ -144,7 +146,7 @@ def custom_handle_is_private_changed(self):
                 exc=FileExistsError,
             )
 
-        # Uses os.rename which is atomic
+        # ? USES os.rename WHICH IS ATOMIC
         shutil.move(source, target)
         self.flags.original_path = {"old": source, "new": target}
         frappe.db.after_rollback.add(self.on_rollback)
@@ -174,14 +176,12 @@ def custom_handle_is_private_changed(self):
             )
 
 
-# -------------------------
-# 2. Override on_trash (Logs Removed)
-# -------------------------
+# ? Override on_trash (Logs Removed)
 def custom_on_trash(self):
     from azure.storage.blob import BlobServiceClient
     from urllib.parse import urlparse
 
-    # --- Original Logic (Unchanged) ---
+    # ? ORIGINAL LOGIC UNCHANGED
     if self.is_home_folder or self.is_attachments_folder:
         frappe.throw(_("Cannot delete Home and Attachments folders"))
 
@@ -192,8 +192,8 @@ def custom_on_trash(self):
     if not self.is_folder:
         self.add_comment_in_reference_doc("Attachment Removed", self.file_name)
 
-    # --- Azure Deletion Logic ---
-    # Check if file is in Azure Storage
+    # ? AZURE DELETION LOGIC
+    # ? CHECK IS THE FILE IS IN AZURE STORAGE
     if self.file_url and "blob.core.windows.net" in self.file_url:
         azure_settings = frappe.get_single("Azure File Upload Settings")
 
@@ -203,33 +203,35 @@ def custom_on_trash(self):
         connection_string = azure_settings.connection_string
 
         try:
-            # Parse URL to extract container and blob name
+            # ? PARSE URL TO EXTRACT CONTAINER AND BLOB NAME
             parsed_url = urlparse(self.file_url)
             path_parts = parsed_url.path.strip("/").split("/")
-            container = path_parts[0]  # Container name from URL
-            blob_name = self.file_name  # We stored blob using file_name
 
-            # Initialize Azure Client
+            # ? CONTAINER NAME FROM URL
+            container = path_parts[0]
+
+            # ? BLOB NAME IS THE FILE NAME
+            blob_name = self.file_name
+
+            # ? INITIALIZE AZURE CLIENT
             blob_service_client = BlobServiceClient.from_connection_string(connection_string)
             blob_client = blob_service_client.get_blob_client(container=container, blob=blob_name)
 
-            # Delete the blob from Azure
+            # ? DELETE THE BLOB FROM AZURE
             blob_client.delete_blob()
 
         except Exception as e:
             frappe.throw(f"Failed to delete file from Azure Storage: {str(e)}")
 
 
-# -------------------------
-# 3. Override upload_file
-# -------------------------
+# ? Override upload_file
 @frappe.whitelist(allow_guest=True)
 def custom_upload_file():
     import os
     from mimetypes import guess_type
     from azure.storage.blob import BlobServiceClient
 
-    # Fetch Azure Settings
+    # ? FETCH AZURE SETTINGS
     azure_settings = frappe.get_single("Azure File Upload Settings")
     enable_azure = azure_settings.enable
     connection_string = azure_settings.connection_string
@@ -258,7 +260,7 @@ def custom_upload_file():
     optimize = frappe.form_dict.optimize
     content = None
 
-    # If it's an existing file reference
+    # ? IF IT'S AN EXISTING FILE REFERENCE
     if library_file := frappe.form_dict.get("library_file_name"):
         frappe.has_permission("File", doc=library_file, throw=True)
         doc = frappe.get_value(
@@ -271,11 +273,11 @@ def custom_upload_file():
         file_url = doc.file_url
         filename = doc.file_name
 
-    # Permission check
+    # ? PERMISSION CHECK
     if not ignore_permissions:
         check_write_permission(doctype, docname)
 
-    # Process file upload
+    # ? PROCESS FILE UPLOAD
     if "file" in files:
         file = files["file"]
         content = file.stream.read()
@@ -294,13 +296,13 @@ def custom_upload_file():
     frappe.local.uploaded_file = content
     frappe.local.uploaded_filename = filename
 
-    # File type validation for guests
+    # ? FILE TYPE VALIDATION FOR GUESTS
     if content is not None and (frappe.session.user == "Guest" or (user and not user.has_desk_access())):
         filetype = guess_type(filename)[0]
         if filetype not in ALLOWED_MIMETYPES:
             frappe.throw(_("You can only upload JPG, PNG, PDF, TXT, CSV or Microsoft documents."))
 
-    # Create or update File document
+    # ? CREATE OR UPDATE FILE DOCUMENT
     if method:
         method = frappe.get_attr(method)
         is_whitelisted(method)
@@ -320,51 +322,62 @@ def custom_upload_file():
             }
         )
         file_doc.save(ignore_permissions=ignore_permissions)
-        result = file_doc  # File document reference
 
-    # Azure Upload Logic
+        # ? FILE DOCUMENT REFERENCE
+        result = file_doc
+
+    # ? AZURE UPLOAD LOGIC
     if enable_azure and content and filename:
-        try:
-            # Select container based on privacy
+        try:    
+
+            # ? GET CURRENT YEAR
+            current_year = datetime.now().year
+
+            # ? GET CURRENT MONTH NAME
+            current_month = datetime.now().strftime("%B")
+
+            # ? SET BLOG AND FILE PATH
+            blob=f"{current_year}/{current_month}/{result.file_name}"
+
+            # ? SELECT CONTAINER BASED ON PRIVACY
             container = private_container if cint(is_private) else public_container
 
-            # Upload to Azure using File document name to avoid collisions
+            # ? UPLOAD TO AZURE USING FILE DOCUMENT NAME TO AVOID COLLISIONS
             blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-            blob_client = blob_service_client.get_blob_client(container=container, blob=result.file_name)
+            blob_client = blob_service_client.get_blob_client(container=container, blob=blob)
             blob_client.upload_blob(content, overwrite=True)
 
-            # Azure file URL
+            # ? AZURE FILE URL
             azure_url = blob_client.url
 
-            # Delete local file (public/private)
+            # ? DELETE LOCAL FILE (PUBLIC/PRIVATE)
             local_path = frappe.get_site_path("private" if result.is_private else "public", "files", result.file_name)
             if os.path.exists(local_path):
                 os.remove(local_path)
 
-            # Update File DocType with Azure URL
+            # ? UPDATE FILE DOCTYPE WITH AZURE URL
             result.db_set("file_url", azure_url)
 
         except Exception as e:
-            # If any error: delete local file and File doc
+            # ? IF ANY ERROR: DELETE LOCAL FILE AND FILE DOC
             try:
                 local_path = frappe.get_site_path("private" if result.is_private else "public", "files", result.file_name)
                 if os.path.exists(local_path):
                     os.remove(local_path)
             except:
-                pass  # Ignore if already deleted
+                # ? IGNORE IF FILE NOT FOUND
+                pass
 
-            # Delete File doc
+            # ? DELETE FILE DOC
             frappe.delete_doc("File", result.name, force=True)
 
-            # Raise error to user
+            # ? RAISE ERROR TO USER
             frappe.throw(f"File upload failed: There is a server error.", title="Azure Upload Error")
 
     return result
 
 
-# -------------------------
-# Monkey-patching
-# -------------------------
+# ? MONKEY PATCHING
 File.handle_is_private_changed = custom_handle_is_private_changed
 File.on_trash = custom_on_trash
 frappe.handler.upload_file = custom_upload_file
