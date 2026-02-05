@@ -7,13 +7,164 @@ import os
 import shutil
 from pathlib import Path
 from urllib.parse import urlparse
-from azure.storage.blob import BlobServiceClient
+from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
 from frappe import _
 from frappe.utils import cint
 from frappe.core.doctype.file.utils import update_existing_file_docs   # FIXED
 from frappe.handler import check_write_permission, ALLOWED_MIMETYPES, is_whitelisted
 from mimetypes import guess_type
-from datetime import datetime
+from datetime import datetime, timedelta
+
+# ? Cached BlobServiceClient (reduce object creation)
+def _get_blob_service_client(connection_string):
+    """
+    Returns cached BlobServiceClient to avoid creating multiple instances
+    """
+    try:
+        cache = getattr(frappe.local, "_azure_blob_service_client_cache", None)
+        if cache and cache.get("cs") == connection_string and cache.get("client"):
+            return cache["client"]
+    except Exception:
+        pass
+
+    client = BlobServiceClient.from_connection_string(connection_string)
+    try:
+        frappe.local._azure_blob_service_client_cache = {"cs": connection_string, "client": client}
+    except Exception:
+        pass
+    return client
+
+
+# ? Extract AccountName + AccountKey from connection string
+def _get_account_name_key(connection_string):
+    """
+    Parse connection string to extract account name and key
+    """
+    try:
+        conn_dict = dict(item.split('=', 1) for item in connection_string.split(';') if '=' in item)
+        account_name = conn_dict.get('AccountName')
+        account_key = conn_dict.get('AccountKey')
+        if not account_name or not account_key:
+            return None, None
+        return account_name, account_key
+    except Exception:
+        return None, None
+
+
+# ? Generate SAS URL (works even when PublicAccessNotPermitted)
+def _get_sas_url(connection_string, container, blob_key, file_name=None, expiry_seconds=120):
+    """
+    Generate Azure Blob SAS URL with read permission
+    """
+    account_name, account_key = _get_account_name_key(connection_string)
+    if not account_name or not account_key:
+        frappe.throw(_("Azure SAS generation failed: connection string must include AccountName and AccountKey."))
+
+    blob_service_client = _get_blob_service_client(connection_string)
+    blob_client = blob_service_client.get_blob_client(container=container, blob=blob_key)
+
+    # ? Content-Disposition filename (optional)
+    cd = None
+    if file_name:
+        cd = f'attachment; filename="{file_name}"'
+
+    sas_token = generate_blob_sas(
+        account_name=account_name,
+        container_name=container,
+        blob_name=blob_key,
+        account_key=account_key,
+        permission=BlobSasPermissions(read=True),
+        expiry=datetime.utcnow() + timedelta(seconds=int(expiry_seconds or 120)),
+        content_disposition=cd,
+    )
+
+    return f"{blob_client.url}?{sas_token}"
+
+
+# ? Public signed redirect (Guest allowed)
+@frappe.whitelist(allow_guest=True)
+def generate_public_file(key=None, file_name=None):
+    """
+    Generate signed URL for public files (guest access allowed)
+    """
+    if not key:
+        frappe.local.response['body'] = "Key not found."
+        return
+
+    azure_settings = frappe.get_single("Azure File Upload Settings")
+    if not azure_settings.enable:
+        frappe.throw(_("Azure Storage is disabled."))
+
+    connection_string = azure_settings.connection_string
+    if not connection_string:
+        frappe.throw(_("Azure connection string is missing."))
+
+    public_container = azure_settings.public_container_name
+
+    signed_url = _get_sas_url(
+        connection_string=connection_string,
+        container=public_container,
+        blob_key=key,
+        file_name=file_name,
+        expiry_seconds=120,
+    )
+
+    frappe.local.response["type"] = "redirect"
+    frappe.local.response["location"] = signed_url
+    return
+
+
+# ? Private signed redirect (login required + permission)
+@frappe.whitelist()
+def generate_file(key=None, file_name=None):
+    """
+    Generate signed URL for private files (requires login and permission)
+    """
+    if not key:
+        frappe.local.response['body'] = "Key not found."
+        return
+
+    if frappe.session.user == "Guest":
+        raise frappe.PermissionError
+
+    # ? Permission check using File doc (Frappe-like)
+    try:
+        f = frappe.get_all(
+            "File",
+            filters={"content_hash": key, "is_private": 1},
+            fields=["name"],
+            limit=1
+        )
+        if f:
+            file_doc = frappe.get_doc("File", f[0].name)
+            frappe.has_permission("File", doc=file_doc, ptype="read", throw=True)
+        else:
+            raise frappe.PermissionError
+    except Exception:
+        raise frappe.PermissionError
+
+    azure_settings = frappe.get_single("Azure File Upload Settings")
+    if not azure_settings.enable:
+        frappe.throw(_("Azure Storage is disabled."))
+
+    connection_string = azure_settings.connection_string
+    if not connection_string:
+        frappe.throw(_("Azure connection string is missing."))
+
+    private_container = azure_settings.private_container_name
+
+    signed_url = _get_sas_url(
+        connection_string=connection_string,
+        container=private_container,
+        blob_key=key,
+        file_name=file_name,
+        expiry_seconds=120,
+    )
+
+    frappe.local.response["type"] = "redirect"
+    frappe.local.response["location"] = signed_url
+    return
+
 
 # ? Override handle_is_private_changed
 def custom_handle_is_private_changed(self):
@@ -22,7 +173,7 @@ def custom_handle_is_private_changed(self):
     from urllib.parse import urlparse
 
     # ? Allow Azure-managed files even though they are remote
-    if self.is_remote_file and "blob.core.windows.net" not in (self.file_url or ""):
+    if self.is_remote_file and "blob.core.windows.net" not in (self.file_url or "") and "/api/method/" not in (self.file_url or ""):
         return
 
     # ? Fetch Azure Settings
@@ -33,25 +184,27 @@ def custom_handle_is_private_changed(self):
     private_container = azure_settings.private_container_name
 
     old_file_url = self.file_url
-    file_name = self.file_url.split("/")[-1]
+    file_name = self.file_url.split("/")[-1] if self.file_url else self.file_name
 
     # ? CASE 1: FILE IS IN AZURE
-    if old_file_url and "blob.core.windows.net" in old_file_url:
+    if old_file_url and ("blob.core.windows.net" in old_file_url or "/api/method/" in old_file_url):
 
         # ? IF NOR ENABLE AZURE, THROW ERROR
         if not enable_azure:
             frappe.throw(_("Azure Storage is disabled. Cannot change privacy of Azure files."))
 
-        try:
-            # ? PARSE CONTAINER FROM OLD URL
-            parsed_url = urlparse(old_file_url)
-            path_parts = parsed_url.path.strip("/").split("/")
+        if not connection_string:
+            frappe.throw(_("Azure connection string is missing."))
 
-            # ? EXTRACT CURRENT CONTAINER FROM URL
-            current_container = path_parts[0]
+        try:
+            # ? GET BLOB KEY FROM content_hash
+            blob_key = (self.content_hash or "").strip()
+
+            if not blob_key:
+                frappe.throw(_("Cannot change privacy: Blob key not found"))
 
             # ? Initialize Azure Client
-            blob_service_client = BlobServiceClient.from_connection_string(connection_string)
+            blob_service_client = _get_blob_service_client(connection_string)
 
             # ? DETERMINE SOURCE AND DESTINATION CONTAINERS
             if cint(self.is_private):
@@ -61,27 +214,46 @@ def custom_handle_is_private_changed(self):
                 source_container = private_container
                 target_container = public_container
 
-            # ? VALIDATE IS SOURCE MATCHES CURRENT CONTAINER (SAFETY CHECK)
-            if current_container != source_container:
-                frappe.throw(_("Azure container mismatch! Expected {0} but found {1}").format(source_container, current_container))
-
             # ? COPY BLOB TO TARGET CONTAINER
-            source_blob = blob_service_client.get_blob_client(container=source_container, blob=self.file_name)
-            target_blob = blob_service_client.get_blob_client(container=target_container, blob=self.file_name)
+            source_blob = blob_service_client.get_blob_client(container=source_container, blob=blob_key)
+            target_blob = blob_service_client.get_blob_client(container=target_container, blob=blob_key)
 
-            # ? START COPY
-            target_blob.start_copy_from_url(source_blob.url)
+            # ? START COPY - Use SAS URL as source (because public access is disabled)
+            sas_source_url = _get_sas_url(
+                connection_string=connection_string,
+                container=source_container,
+                blob_key=blob_key,
+                file_name=self.file_name,
+                expiry_seconds=300,
+            )
+            target_blob.start_copy_from_url(sas_source_url)
 
             # ? WAIT UNTIL COPY COMPLETES (POLLING STATUS)
+            import time
             props = target_blob.get_blob_properties()
+            attempts = 0
             while props.copy.status == "pending":
+                attempts += 1
+                time.sleep(0.3)
                 props = target_blob.get_blob_properties()
+                if attempts > 100:
+                    frappe.throw(_("Azure copy is taking too long. Please try again."))
+
+            if props.copy.status != "success":
+                frappe.throw(_("Azure blob copy failed: {0}").format(props.copy.status))
 
             # ? DELETE ORIGINAL BLOB
             source_blob.delete_blob()
 
-            # ? UPDATE file_url TO NEW CONTAINER URL
-            self.file_url = target_blob.url
+            # ? UPDATE file_url BASED ON PRIVACY
+            if cint(self.is_private):
+                # ? FOR PRIVATE FILES, USE API METHOD URL
+                method = "prompt_azure_blob_integration.generate_file"
+                self.file_url = f"/api/method/{method}?key={blob_key}&file_name={file_name}"
+            else:
+                # ? FOR PUBLIC FILES ALSO USE API METHOD URL (because public access is disabled)
+                method = "prompt_azure_blob_integration.generate_public_file"
+                self.file_url = f"/api/method/{method}?key={blob_key}&file_name={file_name}"
 
             # ? UPDATE REFERENCE IN ATTACHED DOCTYPES
             update_existing_file_docs(self)
@@ -194,28 +366,33 @@ def custom_on_trash(self):
 
     # ? AZURE DELETION LOGIC
     # ? CHECK IS THE FILE IS IN AZURE STORAGE
-    if self.file_url and "blob.core.windows.net" in self.file_url:
+    if self.content_hash and (("blob.core.windows.net" in (self.file_url or "")) or ("/api/method/" in (self.file_url or ""))):
         azure_settings = frappe.get_single("Azure File Upload Settings")
 
         if not azure_settings.enable:
             frappe.throw(_("Azure Storage is disabled. Cannot delete file stored in Azure."))
 
         connection_string = azure_settings.connection_string
+        if not connection_string:
+            frappe.throw(_("Azure connection string is missing. Cannot delete file stored in Azure."))
 
         try:
-            # ? PARSE URL TO EXTRACT CONTAINER AND BLOB NAME
-            parsed_url = urlparse(self.file_url)
-            path_parts = parsed_url.path.strip("/").split("/")
+            # ? BLOB KEY IS STORED IN content_hash FIELD
+            blob_key = (self.content_hash or "").strip()
 
-            # ? CONTAINER NAME FROM URL
-            container = path_parts[0]
+            if not blob_key:
+                frappe.throw(_("Azure blob key not found. Cannot delete file stored in Azure."))
 
-            # ? BLOB NAME IS THE FILE NAME
-            blob_name = self.file_name
+            # ? DETERMINE CONTAINER BASED ON PRIVACY
+            container = (
+                azure_settings.private_container_name
+                if cint(self.is_private)
+                else azure_settings.public_container_name
+            )
 
             # ? INITIALIZE AZURE CLIENT
-            blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-            blob_client = blob_service_client.get_blob_client(container=container, blob=blob_name)
+            blob_service_client = _get_blob_service_client(connection_string)
+            blob_client = blob_service_client.get_blob_client(container=container, blob=blob_key)
 
             # ? DELETE THE BLOB FROM AZURE
             blob_client.delete_blob()
@@ -343,20 +520,28 @@ def custom_upload_file():
             container = private_container if cint(is_private) else public_container
 
             # ? UPLOAD TO AZURE USING FILE DOCUMENT NAME TO AVOID COLLISIONS
-            blob_service_client = BlobServiceClient.from_connection_string(connection_string)
-            blob_client = blob_service_client.get_blob_client(container=container, blob=blob)
+            blob_service_client = _get_blob_service_client(connection_string)
+            blob_client = blob_service_client.get_blob_client(container=container, blob=blob_key)
             blob_client.upload_blob(content, overwrite=True)
 
-            # ? AZURE FILE URL
-            azure_url = blob_client.url
+            # ? SET FILE URL BASED ON PRIVACY
+            if cint(is_private):
+                # ? FOR PRIVATE FILES, USE API METHOD URL (SIGNED URL WILL BE GENERATED ON ACCESS)
+                method = "prompt_azure_blob_integration.generate_file"
+                azure_url = f"/api/method/{method}?key={blob}&file_name={result.file_name}"
+            else:
+                # ? FOR PUBLIC FILES ALSO USE API METHOD URL (because public access is disabled)
+                method = "prompt_azure_blob_integration.generate_public_file"
+                azure_url = f"/api/method/{method}?key={blob}&file_name={result.file_name}"
 
             # ? DELETE LOCAL FILE (PUBLIC/PRIVATE)
             local_path = frappe.get_site_path("private" if result.is_private else "public", "files", result.file_name)
             if os.path.exists(local_path):
                 os.remove(local_path)
 
-            # ? UPDATE FILE DOCTYPE WITH AZURE URL
+            # ? UPDATE FILE DOCTYPE WITH AZURE URL AND STORE BLOB KEY IN content_hash
             result.db_set("file_url", azure_url)
+            result.db_set("content_hash", blob)
 
         except Exception as e:
             # ? IF ANY ERROR: DELETE LOCAL FILE AND FILE DOC
@@ -372,6 +557,7 @@ def custom_upload_file():
             frappe.delete_doc("File", result.name, force=True)
 
             # ? RAISE ERROR TO USER
+            frappe.log_error(f"Azure upload error: {str(e)}", "Azure Upload Error")
             frappe.throw(f"File upload failed: There is a server error.", title="Azure Upload Error")
 
     return result
