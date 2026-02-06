@@ -6,8 +6,9 @@ from frappe.handler import optimize_image, upload_file as core_upload_file
 import os
 import shutil
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote, unquote_plus
 from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
+from azure.core.exceptions import ResourceNotFoundError
 from frappe import _
 from frappe.utils import cint
 from frappe.core.doctype.file.utils import update_existing_file_docs   # FIXED
@@ -51,8 +52,75 @@ def _get_account_name_key(connection_string):
         return None, None
 
 
+# ? Normalize query params (avoid double encoding issues)
+def _normalize_qs_value(v):
+    """
+    Converts %20 / + into spaces if present, keeps normal strings unchanged.
+    """
+    try:
+        return unquote_plus((v or "").strip())
+    except Exception:
+        return (v or "").strip()
+
+
+# ? Build /api/method url with proper encoding (IMPORTANT for preview)
+def _build_method_url(method, blob_key, file_name):
+    """
+    Encode query params so spaces/special chars do not break <embed src="..."> preview
+    """
+    blob_key = _normalize_qs_value(blob_key)
+    file_name = _normalize_qs_value(file_name)
+
+    # ? keep "/" in key as-is because Azure blob_key contains folders (YYYY/Month/filename)
+    q_key = quote((blob_key or "").strip(), safe="/")
+    q_name = quote((file_name or "").strip(), safe="")
+    return f"/api/method/{method}?key={q_key}&file_name={q_name}"
+
+
+# ? Decide preview vs download (inline vs attachment)
+def _is_previewable_mimetype(file_name=None, content_type=None):
+    """
+    Previewable types should be inline so system can show preview instead of forcing download.
+    """
+    ct = content_type or (guess_type(file_name or "")[0] or "")
+    ct = (ct or "").lower()
+
+    if ct == "application/pdf":
+        return True
+
+    if ct.startswith("image/"):
+        return True
+
+    if ct.startswith("text/"):
+        return True
+
+    if ct in ("application/json", "application/xml"):
+        return True
+
+    return False
+
+
+# ? Send inline response for preview
+def _send_inline_preview_from_azure(blob_service_client, container, blob_key, file_name):
+    ct = guess_type(file_name or "")[0] or "application/octet-stream"
+
+    blob_client = blob_service_client.get_blob_client(container=container, blob=blob_key)
+    data = blob_client.download_blob().readall()
+
+    frappe.local.response.filename = file_name or (blob_key.split("/")[-1] if blob_key else "file")
+    frappe.local.response.filecontent = data
+    frappe.local.response["content_type"] = ct
+    frappe.local.response["as_attachment"] = 0
+
+    if (ct or "").lower() == "application/pdf":
+        frappe.local.response.type = "pdf"
+    else:
+        frappe.local.response.type = "download"
+    return
+
+
 # ? Generate SAS URL (works even when PublicAccessNotPermitted)
-def _get_sas_url(connection_string, container, blob_key, file_name=None, expiry_seconds=120):
+def _get_sas_url(connection_string, container, blob_key, file_name=None, expiry_seconds=120, force_download=0):
     """
     Generate Azure Blob SAS URL with read permission
     """
@@ -65,8 +133,13 @@ def _get_sas_url(connection_string, container, blob_key, file_name=None, expiry_
 
     # ? Content-Disposition filename (optional)
     cd = None
-    if file_name:
-        cd = f'attachment; filename="{file_name}"'
+    safe_name = file_name or (blob_key.split("/")[-1] if blob_key else "file")
+    previewable = _is_previewable_mimetype(file_name=safe_name)
+
+    if cint(force_download) or (not previewable):
+        cd = f'attachment; filename="{safe_name}"'
+    else:
+        cd = f'inline; filename="{safe_name}"'
 
     sas_token = generate_blob_sas(
         account_name=account_name,
@@ -83,13 +156,21 @@ def _get_sas_url(connection_string, container, blob_key, file_name=None, expiry_
 
 # ? Public signed redirect (Guest allowed)
 @frappe.whitelist(allow_guest=True)
-def generate_public_file(key=None, file_name=None):
+def generate_public_file(key=None, file_name=None, download=0):
     """
     Generate signed URL for public files (guest access allowed)
     """
     if not key:
         frappe.local.response['body'] = "Key not found."
         return
+
+    # ? normalize incoming key/name (handles %20, +, double-encoding cases)
+    key = _normalize_qs_value(key)
+    file_name = _normalize_qs_value(file_name)
+
+    # ? allow querystring ?download=1 also
+    if not download:
+        download = frappe.form_dict.get("download") or 0
 
     azure_settings = frappe.get_single("Azure File Upload Settings")
     if not azure_settings.enable:
@@ -101,12 +182,21 @@ def generate_public_file(key=None, file_name=None):
 
     public_container = azure_settings.public_container_name
 
+    blob_service_client = _get_blob_service_client(connection_string)
+
+    # ? PREVIEW MODE
+    if not cint(download) and _is_previewable_mimetype(file_name=file_name):
+        _send_inline_preview_from_azure(blob_service_client, public_container, key, file_name)
+        return
+
+    # ? DOWNLOAD MODE / NON-PREVIEWABLE: redirect to SAS (attachment / binary)
     signed_url = _get_sas_url(
         connection_string=connection_string,
         container=public_container,
         blob_key=key,
         file_name=file_name,
         expiry_seconds=120,
+        force_download=download,
     )
 
     frappe.local.response["type"] = "redirect"
@@ -116,13 +206,21 @@ def generate_public_file(key=None, file_name=None):
 
 # ? Private signed redirect (login required + permission)
 @frappe.whitelist()
-def generate_private_file(key=None, file_name=None):
+def generate_private_file(key=None, file_name=None, download=0):
     """
     Generate signed URL for private files (requires login and permission)
     """
     if not key:
         frappe.local.response['body'] = "Key not found."
         return
+
+    # ? normalize incoming key/name (handles %20, +, double-encoding cases)
+    key = _normalize_qs_value(key)
+    file_name = _normalize_qs_value(file_name)
+
+    # ? allow querystring ?download=1 also
+    if not download:
+        download = frappe.form_dict.get("download") or 0
 
     if frappe.session.user == "Guest":
         raise frappe.PermissionError
@@ -153,12 +251,21 @@ def generate_private_file(key=None, file_name=None):
 
     private_container = azure_settings.private_container_name
 
+    blob_service_client = _get_blob_service_client(connection_string)
+
+    # ? PREVIEW MODE
+    if not cint(download) and _is_previewable_mimetype(file_name=file_name):
+        _send_inline_preview_from_azure(blob_service_client, private_container, key, file_name)
+        return
+
+    # ? DOWNLOAD MODE / NON-PREVIEWABLE: redirect to SAS (attachment / binary)
     signed_url = _get_sas_url(
         connection_string=connection_string,
         container=private_container,
         blob_key=key,
         file_name=file_name,
         expiry_seconds=120,
+        force_download=download,
     )
 
     frappe.local.response["type"] = "redirect"
@@ -184,7 +291,7 @@ def custom_handle_is_private_changed(self):
     private_container = azure_settings.private_container_name
 
     old_file_url = self.file_url
-    file_name = self.file_url.split("/")[-1] if self.file_url else self.file_name
+    file_name = self.file_name or (self.file_url.split("/")[-1] if self.file_url else self.file_name)
 
     # ? CASE 1: FILE IS IN AZURE
     if old_file_url and ("blob.core.windows.net" in old_file_url or "/api/method/" in old_file_url):
@@ -225,6 +332,7 @@ def custom_handle_is_private_changed(self):
                 blob_key=blob_key,
                 file_name=self.file_name,
                 expiry_seconds=300,
+                force_download=1,
             )
             target_blob.start_copy_from_url(sas_source_url)
 
@@ -243,17 +351,20 @@ def custom_handle_is_private_changed(self):
                 frappe.throw(_("Azure blob copy failed: {0}").format(props.copy.status))
 
             # ? DELETE ORIGINAL BLOB
-            source_blob.delete_blob()
+            try:
+                source_blob.delete_blob()
+            except ResourceNotFoundError:
+                pass
 
             # ? UPDATE file_url BASED ON PRIVACY
             if cint(self.is_private):
                 # ? FOR PRIVATE FILES, USE API METHOD URL
                 method = "prompt_azure_blob_integration.generate_private_file"
-                self.file_url = f"/api/method/{method}?key={blob_key}&file_name={file_name}"
+                self.file_url = _build_method_url(method, blob_key, file_name)
             else:
                 # ? FOR PUBLIC FILES ALSO USE API METHOD URL (because public access is disabled)
                 method = "prompt_azure_blob_integration.generate_public_file"
-                self.file_url = f"/api/method/{method}?key={blob_key}&file_name={file_name}"
+                self.file_url = _build_method_url(method, blob_key, file_name)
 
             # ? UPDATE REFERENCE IN ATTACHED DOCTYPES
             update_existing_file_docs(self)
@@ -378,24 +489,37 @@ def custom_on_trash(self):
 
         try:
             # ? BLOB KEY IS STORED IN content_hash FIELD
-            blob_key = (self.content_hash or "").strip()
+            blob_key = _normalize_qs_value(self.content_hash or "")
 
             if not blob_key:
                 frappe.throw(_("Azure blob key not found. Cannot delete file stored in Azure."))
 
+            public_container = azure_settings.public_container_name
+            private_container = azure_settings.private_container_name
+
             # ? DETERMINE CONTAINER BASED ON PRIVACY
             container = (
-                azure_settings.private_container_name
+                private_container
                 if cint(self.is_private)
-                else azure_settings.public_container_name
+                else public_container
             )
 
             # ? INITIALIZE AZURE CLIENT
             blob_service_client = _get_blob_service_client(connection_string)
-            blob_client = blob_service_client.get_blob_client(container=container, blob=blob_key)
 
-            # ? DELETE THE BLOB FROM AZURE
-            blob_client.delete_blob()
+            # ? TRY DELETE FROM EXPECTED CONTAINER
+            try:
+                blob_client = blob_service_client.get_blob_client(container=container, blob=blob_key)
+                blob_client.delete_blob()
+            except ResourceNotFoundError:
+                # ? IF NOT FOUND, TRY OTHER CONTAINER (privacy mismatch / moved file)
+                other_container = public_container if container == private_container else private_container
+                try:
+                    blob_client = blob_service_client.get_blob_client(container=other_container, blob=blob_key)
+                    blob_client.delete_blob()
+                except ResourceNotFoundError:
+                    # ? ALREADY DELETED OR NEVER UPLOADED - DO NOT BLOCK USER DELETE
+                    pass
 
         except Exception as e:
             frappe.throw(f"Failed to delete file from Azure Storage: {str(e)}")
@@ -528,11 +652,11 @@ def custom_upload_file():
             if cint(is_private):
                 # ? FOR PRIVATE FILES, USE API METHOD URL (SIGNED URL WILL BE GENERATED ON ACCESS)
                 method = "prompt_azure_blob_integration.generate_private_file"
-                azure_url = f"/api/method/{method}?key={blob_key}&file_name={result.file_name}"
+                azure_url = _build_method_url(method, blob_key, result.file_name)
             else:
                 # ? FOR PUBLIC FILES ALSO USE API METHOD URL (because public access is disabled)
                 method = "prompt_azure_blob_integration.generate_public_file"
-                azure_url = f"/api/method/{method}?key={blob_key}&file_name={result.file_name}"
+                azure_url = _build_method_url(method, blob_key, result.file_name)
 
             # ? DELETE LOCAL FILE (PUBLIC/PRIVATE)
             local_path = frappe.get_site_path("private" if result.is_private else "public", "files", result.file_name)
