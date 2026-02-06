@@ -116,7 +116,7 @@ def generate_public_file(key=None, file_name=None):
 
 # ? Private signed redirect (login required + permission)
 @frappe.whitelist()
-def generate_file(key=None, file_name=None):
+def generate_private_file(key=None, file_name=None):
     """
     Generate signed URL for private files (requires login and permission)
     """
@@ -248,7 +248,7 @@ def custom_handle_is_private_changed(self):
             # ? UPDATE file_url BASED ON PRIVACY
             if cint(self.is_private):
                 # ? FOR PRIVATE FILES, USE API METHOD URL
-                method = "prompt_azure_blob_integration.generate_file"
+                method = "prompt_azure_blob_integration.generate_private_file"
                 self.file_url = f"/api/method/{method}?key={blob_key}&file_name={file_name}"
             else:
                 # ? FOR PUBLIC FILES ALSO USE API METHOD URL (because public access is disabled)
@@ -514,7 +514,7 @@ def custom_upload_file():
             current_month = datetime.now().strftime("%B")
 
             # ? SET BLOG AND FILE PATH
-            blob=f"{current_year}/{current_month}/{result.file_name}"
+            blob_key=f"{current_year}/{current_month}/{result.file_name}"
 
             # ? SELECT CONTAINER BASED ON PRIVACY
             container = private_container if cint(is_private) else public_container
@@ -527,12 +527,12 @@ def custom_upload_file():
             # ? SET FILE URL BASED ON PRIVACY
             if cint(is_private):
                 # ? FOR PRIVATE FILES, USE API METHOD URL (SIGNED URL WILL BE GENERATED ON ACCESS)
-                method = "prompt_azure_blob_integration.generate_file"
-                azure_url = f"/api/method/{method}?key={blob}&file_name={result.file_name}"
+                method = "prompt_azure_blob_integration.generate_private_file"
+                azure_url = f"/api/method/{method}?key={blob_key}&file_name={result.file_name}"
             else:
                 # ? FOR PUBLIC FILES ALSO USE API METHOD URL (because public access is disabled)
                 method = "prompt_azure_blob_integration.generate_public_file"
-                azure_url = f"/api/method/{method}?key={blob}&file_name={result.file_name}"
+                azure_url = f"/api/method/{method}?key={blob_key}&file_name={result.file_name}"
 
             # ? DELETE LOCAL FILE (PUBLIC/PRIVATE)
             local_path = frappe.get_site_path("private" if result.is_private else "public", "files", result.file_name)
@@ -541,7 +541,7 @@ def custom_upload_file():
 
             # ? UPDATE FILE DOCTYPE WITH AZURE URL AND STORE BLOB KEY IN content_hash
             result.db_set("file_url", azure_url)
-            result.db_set("content_hash", blob)
+            result.db_set("content_hash", blob_key)
 
         except Exception as e:
             # ? IF ANY ERROR: DELETE LOCAL FILE AND FILE DOC
