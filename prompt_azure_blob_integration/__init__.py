@@ -686,8 +686,123 @@ def custom_upload_file():
 
     return result
 
+def custom_validate_file_on_disk(self):
+    """
+    Skip disk validation for Azure / API-based remote files.
+    Execute original logic for local files.
+    """
+
+    file_url = self.file_url or ""
+
+    # Azure / remote files → DO NOT TOUCH DISK
+    if (
+        "/api/method/" in file_url
+        or "blob.core.windows.net" in file_url
+    ):
+        # Simply return → no validation
+        return True
+
+    # Local files → original behavior
+    return self._original_validate_file_on_disk()
+
+
+def azure_after_insert(self):
+    """
+    Capture ALL file uploads (UI + code + ERPNext internals)
+    and move them to Azure
+    """
+
+    # Skip folders
+    if self.is_folder:
+        return
+
+    # Already Azure-managed
+    if self.file_url and (
+        "/api/method/" in self.file_url
+        or "blob.core.windows.net" in self.file_url
+    ):
+        return
+
+    azure_settings = frappe.get_single("Azure File Upload Settings")
+    if not azure_settings.enable:
+        return
+
+    # No local file
+    if not self.file_url or not self.file_url.startswith(("/files/", "/private/files/")):
+        return
+
+    is_private = cint(self.is_private)
+    file_name = self.file_name
+
+    local_path = frappe.get_site_path(
+        "private" if is_private else "public",
+        "files",
+        file_name
+    )
+
+    if not os.path.exists(local_path):
+        return
+
+    # Build blob key
+    year = datetime.now().year
+    month = datetime.now().strftime("%B")
+    blob_key = f"{year}/{month}/{file_name}"
+
+    container = (
+        azure_settings.private_container_name
+        if is_private
+        else azure_settings.public_container_name
+    )
+
+    blob_service_client = _get_blob_service_client(
+        azure_settings.connection_string
+    )
+    blob_client = blob_service_client.get_blob_client(
+        container=container,
+        blob=blob_key
+    )
+
+    # Upload
+    with open(local_path, "rb") as f:
+        blob_client.upload_blob(f, overwrite=True)
+
+    # Build API URL
+    method = (
+        "prompt_azure_blob_integration.generate_private_file"
+        if is_private
+        else "prompt_azure_blob_integration.generate_public_file"
+    )
+
+    azure_url = _build_method_url(method, blob_key, file_name)
+
+    # Update DB directly (no recursion)
+    frappe.db.set_value(
+        "File",
+        self.name,
+        {
+            "file_url": azure_url,
+            "content_hash": blob_key,
+        },
+        update_modified=False,
+    )
+
+    # Remove local file
+    try:
+        os.remove(local_path)
+    except Exception:
+        pass
+
+
+
+
+
 
 # ? MONKEY PATCHING
+if not hasattr(File, "_original_validate_file_on_disk"):
+    File._original_validate_file_on_disk = File.validate_file_on_disk
+
+File.after_insert = azure_after_insert
+File.validate_file_on_disk = custom_validate_file_on_disk
 File.handle_is_private_changed = custom_handle_is_private_changed
 File.on_trash = custom_on_trash
 frappe.handler.upload_file = custom_upload_file
