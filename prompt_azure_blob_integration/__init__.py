@@ -6,9 +6,9 @@ from frappe.handler import optimize_image, upload_file as core_upload_file
 import os
 import shutil
 from pathlib import Path
-from urllib.parse import urlparse, quote, unquote_plus
+from urllib.parse import urlparse, quote, unquote, unquote_plus, parse_qs
 from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
-from azure.core.exceptions import ResourceNotFoundError
+from azure.core.exceptions import ResourceNotFoundError, ResourceExistsError
 from frappe import _
 from frappe.utils import cint
 from frappe.core.doctype.file.utils import update_existing_file_docs   # FIXED
@@ -75,6 +75,79 @@ def _build_method_url(method, blob_key, file_name):
     q_key = quote((blob_key or "").strip(), safe="/")
     q_name = quote((file_name or "").strip(), safe="")
     return f"/api/method/{method}?key={q_key}&file_name={q_name}"
+
+
+# ? Our own file endpoints (only these URLs are trusted to carry a blob key)
+AZURE_FILE_METHODS = (
+    "prompt_azure_blob_integration.generate_public_file",
+    "prompt_azure_blob_integration.generate_private_file",
+)
+
+
+# ? Resolve blob key of a File (content_hash first, then fall back to file_url)
+def _get_blob_key(file_doc, azure_settings):
+    """
+    Frappe clears content_hash while validating files whose URL starts with http(s)://,
+    and older files may have it empty, so recover the key from file_url when needed:
+      /api/method/<our method>?key=<blob key>&file_name=...
+      https://<account>.blob.core.windows.net/<container>/<blob key>
+    Only URLs of our own endpoints / our own storage account and containers are trusted,
+    so an unrelated URL can never make us copy or delete some other blob.
+    """
+    key = (file_doc.content_hash or "").strip()
+    if key:
+        return key
+
+    parsed = urlparse(file_doc.file_url or "")
+
+    if parsed.path.startswith("/api/method/"):
+        if parsed.path[len("/api/method/"):] not in AZURE_FILE_METHODS:
+            return ""
+        return parse_qs(parsed.query).get("key", [""])[0].strip()
+
+    if parsed.netloc.lower().endswith(".blob.core.windows.net"):
+        account_name, account_key = _get_account_name_key(azure_settings.connection_string)
+        if not account_name or parsed.netloc.split(".")[0].lower() != account_name.lower():
+            return ""
+
+        # ? first path segment is the container, the rest is the blob key
+        container, separator, key = unquote(parsed.path).lstrip("/").partition("/")
+        if container not in (azure_settings.public_container_name, azure_settings.private_container_name):
+            return ""
+        return key.strip()
+
+    return ""
+
+
+# ? Is this file_url already served through Azure
+def _is_azure_managed_url(file_url):
+    file_url = file_url or ""
+    return "/api/method/" in file_url or "blob.core.windows.net" in file_url
+
+
+# ? Upload a blob without ever overwriting an existing one
+def _upload_blob_unique(blob_service_client, container, blob_key, data):
+    """
+    Uploads data and returns the blob key that was really used. If the key is already taken
+    (a file with the same name was uploaded before), a short random suffix is added before the
+    extension so another user's file is never overwritten.
+    """
+    stem, extension = os.path.splitext(blob_key)
+    candidate = blob_key
+
+    for attempt in range(5):
+        # ? data may be a stream, rewind it for every attempt
+        if hasattr(data, "seek"):
+            data.seek(0)
+
+        try:
+            blob_client = blob_service_client.get_blob_client(container=container, blob=candidate)
+            blob_client.upload_blob(data, overwrite=False)
+            return candidate
+        except ResourceExistsError:
+            candidate = f"{stem}_{frappe.generate_hash(length=6)}{extension}"
+
+    frappe.throw(_("Could not find a free file name in Azure Storage. Please try again."))
 
 
 # ? Build blob key (YYYY/Month/filename only if folder structure is enabled)
@@ -327,8 +400,8 @@ def custom_handle_is_private_changed(self):
             frappe.throw(_("Azure connection string is missing."))
 
         try:
-            # ? GET BLOB KEY FROM content_hash
-            blob_key = (self.content_hash or "").strip()
+            # ? GET BLOB KEY FROM content_hash (FALLBACK: file_url)
+            blob_key = _get_blob_key(self, azure_settings)
 
             if not blob_key:
                 frappe.throw(_("Cannot change privacy: Blob key not found"))
@@ -347,6 +420,14 @@ def custom_handle_is_private_changed(self):
             # ? COPY BLOB TO TARGET CONTAINER
             source_blob = blob_service_client.get_blob_client(container=source_container, blob=blob_key)
             target_blob = blob_service_client.get_blob_client(container=target_container, blob=blob_key)
+
+            # ? NEVER OVERWRITE ANOTHER FILE THAT ALREADY HAS THE SAME NAME IN THE TARGET CONTAINER
+            if target_blob.exists():
+                frappe.throw(
+                    _("A file named {0} already exists in the {1} container. Rename one of the files and try again.").format(
+                        blob_key, "private" if cint(self.is_private) else "public"
+                    )
+                )
 
             # ? START COPY - Use SAS URL as source (because public access is disabled)
             sas_source_url = _get_sas_url(
@@ -388,6 +469,9 @@ def custom_handle_is_private_changed(self):
                 # ? FOR PUBLIC FILES ALSO USE API METHOD URL (because public access is disabled)
                 method = "prompt_azure_blob_integration.generate_public_file"
                 self.file_url = _build_method_url(method, blob_key, file_name)
+
+            # ? KEEP BLOB KEY SAVED (Frappe may have cleared it, see _get_blob_key)
+            self.content_hash = blob_key
 
             # ? UPDATE REFERENCE IN ATTACHED DOCTYPES
             update_existing_file_docs(self)
@@ -500,8 +584,15 @@ def custom_on_trash(self):
 
     # ? AZURE DELETION LOGIC
     # ? CHECK IS THE FILE IS IN AZURE STORAGE
-    if self.content_hash and (("blob.core.windows.net" in (self.file_url or "")) or ("/api/method/" in (self.file_url or ""))):
+    if ("blob.core.windows.net" in (self.file_url or "")) or ("/api/method/" in (self.file_url or "")):
         azure_settings = frappe.get_single("Azure File Upload Settings")
+
+        # ? BLOB KEY IS STORED IN content_hash FIELD (FALLBACK: file_url)
+        blob_key = _get_blob_key(self, azure_settings)
+
+        # ? NOT AN AZURE FILE OF THIS APP / NO KEY TO DELETE - DO NOT BLOCK USER DELETE
+        if not blob_key:
+            return
 
         if not azure_settings.enable:
             frappe.throw(_("Azure Storage is disabled. Cannot delete file stored in Azure."))
@@ -511,12 +602,6 @@ def custom_on_trash(self):
             frappe.throw(_("Azure connection string is missing. Cannot delete file stored in Azure."))
 
         try:
-            # ? BLOB KEY IS STORED IN content_hash FIELD
-            blob_key = _normalize_qs_value(self.content_hash or "")
-
-            if not blob_key:
-                frappe.throw(_("Azure blob key not found. Cannot delete file stored in Azure."))
-
             public_container = azure_settings.public_container_name
             private_container = azure_settings.private_container_name
 
@@ -650,9 +735,9 @@ def custom_upload_file():
         # ? FILE DOCUMENT REFERENCE
         result = file_doc
 
-    # ? AZURE UPLOAD LOGIC
-    if enable_azure and content and filename:
-        try:    
+    # ? AZURE UPLOAD LOGIC (SKIP IF azure_after_insert ALREADY MOVED THE FILE TO AZURE)
+    if enable_azure and content and filename and not _is_azure_managed_url(getattr(result, "file_url", None)):
+        try:
 
             # ? SET BLOB KEY (YEAR/MONTH FOLDERS ONLY IF ENABLED IN SETTINGS)
             blob_key = _build_blob_key(azure_settings, result.file_name)
@@ -660,10 +745,9 @@ def custom_upload_file():
             # ? SELECT CONTAINER BASED ON PRIVACY
             container = private_container if cint(is_private) else public_container
 
-            # ? UPLOAD TO AZURE USING FILE DOCUMENT NAME TO AVOID COLLISIONS
+            # ? UPLOAD TO AZURE (NEVER OVERWRITES AN EXISTING FILE WITH THE SAME NAME)
             blob_service_client = _get_blob_service_client(connection_string)
-            blob_client = blob_service_client.get_blob_client(container=container, blob=blob_key)
-            blob_client.upload_blob(content, overwrite=True)
+            blob_key = _upload_blob_unique(blob_service_client, container, blob_key, content)
 
             # ? SET FILE URL BASED ON PRIVACY
             if cint(is_private):
@@ -772,14 +856,10 @@ def azure_after_insert(self):
     blob_service_client = _get_blob_service_client(
         azure_settings.connection_string
     )
-    blob_client = blob_service_client.get_blob_client(
-        container=container,
-        blob=blob_key
-    )
 
-    # Upload
+    # Upload (never overwrites an existing file with the same name)
     with open(local_path, "rb") as f:
-        blob_client.upload_blob(f, overwrite=True)
+        blob_key = _upload_blob_unique(blob_service_client, container, blob_key, f)
 
     # Build API URL
     method = (
@@ -800,6 +880,10 @@ def azure_after_insert(self):
         },
         update_modified=False,
     )
+
+    # Keep the in-memory doc in sync with the database
+    self.file_url = azure_url
+    self.content_hash = blob_key
 
     # Remove local file
     try:
