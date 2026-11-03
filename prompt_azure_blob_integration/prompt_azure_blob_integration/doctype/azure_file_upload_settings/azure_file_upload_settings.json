@@ -8,7 +8,9 @@
   "enable",
   "connection_string",
   "public_container_name",
-  "private_container_name"
+  "private_container_name",
+  "access_control_section",
+  "require_login_for_files"
  ],
  "fields": [
   {
@@ -37,13 +39,25 @@
    "in_list_view": 1,
    "label": "Private Container Name",
    "reqd": 1
+  },
+  {
+   "fieldname": "access_control_section",
+   "fieldtype": "Section Break",
+   "label": "Access Control"
+  },
+  {
+   "default": "0",
+   "description": "If enabled, no file (public or private) can be opened from Azure without logging in. Guests, including website pages and public links, will get a 403 error.",
+   "fieldname": "require_login_for_files",
+   "fieldtype": "Check",
+   "label": "Require Login to Access Files"
   }
  ],
  "grid_page_length": 50,
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2025-07-28 15:44:29.951315",
+ "modified": "2026-11-03 12:00:00.000000",
  "modified_by": "Administrator",
  "module": "Prompt Azure Blob Integration",
  "name": "Azure File Upload Settings",

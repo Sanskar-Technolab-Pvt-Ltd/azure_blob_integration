@@ -154,7 +154,16 @@ def _get_sas_url(connection_string, container, blob_key, file_name=None, expiry_
     return f"{blob_client.url}?{sas_token}"
 
 
-# ? Public signed redirect (Guest allowed)
+# ? Block Guest access when "Require Login to Access Files" is enabled
+def _enforce_login_if_required(azure_settings):
+    """
+    If enabled in Azure File Upload Settings, public files are also served to logged-in users only
+    """
+    if cint(azure_settings.require_login_for_files) and frappe.session.user == "Guest":
+        frappe.throw(_("Login is required to access this file."), frappe.PermissionError)
+
+
+# ? Public signed redirect (Guest allowed unless "Require Login to Access Files" is enabled)
 @frappe.whitelist(allow_guest=True)
 def generate_public_file(key=None, file_name=None, download=0):
     """
@@ -175,6 +184,8 @@ def generate_public_file(key=None, file_name=None, download=0):
     azure_settings = frappe.get_single("Azure File Upload Settings")
     if not azure_settings.enable:
         frappe.throw(_("Azure Storage is disabled."))
+
+    _enforce_login_if_required(azure_settings)
 
     connection_string = azure_settings.connection_string
     if not connection_string:
