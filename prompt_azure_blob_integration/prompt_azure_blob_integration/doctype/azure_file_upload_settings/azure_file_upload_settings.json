@@ -9,6 +9,7 @@
   "connection_string",
   "public_container_name",
   "private_container_name",
+  "use_folder_structure",
   "access_control_section",
   "require_login_for_files"
  ],
@@ -41,6 +42,13 @@
    "reqd": 1
   },
   {
+   "default": "0",
+   "description": "If enabled, new files are uploaded inside Year/Month folders (e.g. 2026/November/file.pdf). If disabled, files are uploaded directly to the container root. Existing files are not moved.",
+   "fieldname": "use_folder_structure",
+   "fieldtype": "Check",
+   "label": "Use Year/Month Folder Structure"
+  },
+  {
    "fieldname": "access_control_section",
    "fieldtype": "Section Break",
    "label": "Access Control"
@@ -57,7 +65,7 @@
  "index_web_pages_for_search": 1,
  "issingle": 1,
  "links": [],
- "modified": "2026-11-03 12:00:00.000000",
+ "modified": "2026-11-03 15:00:00.000000",
  "modified_by": "Administrator",
  "module": "Prompt Azure Blob Integration",
  "name": "Azure File Upload Settings",
