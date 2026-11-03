@@ -77,6 +77,18 @@ def _build_method_url(method, blob_key, file_name):
     return f"/api/method/{method}?key={q_key}&file_name={q_name}"
 
 
+# ? Build blob key (YYYY/Month/filename only if folder structure is enabled)
+def _build_blob_key(azure_settings, file_name):
+    """
+    Returns "YYYY/Month/filename" when "Use Year/Month Folder Structure" is enabled,
+    otherwise just the filename (uploaded directly to the container root)
+    """
+    if cint(azure_settings.use_folder_structure):
+        now = datetime.now()
+        return f"{now.year}/{now.strftime('%B')}/{file_name}"
+    return file_name
+
+
 # ? Decide preview vs download (inline vs attachment)
 def _is_previewable_mimetype(file_name=None, content_type=None):
     """
@@ -642,14 +654,8 @@ def custom_upload_file():
     if enable_azure and content and filename:
         try:    
 
-            # ? GET CURRENT YEAR
-            current_year = datetime.now().year
-
-            # ? GET CURRENT MONTH NAME
-            current_month = datetime.now().strftime("%B")
-
-            # ? SET BLOG AND FILE PATH
-            blob_key=f"{current_year}/{current_month}/{result.file_name}"
+            # ? SET BLOB KEY (YEAR/MONTH FOLDERS ONLY IF ENABLED IN SETTINGS)
+            blob_key = _build_blob_key(azure_settings, result.file_name)
 
             # ? SELECT CONTAINER BASED ON PRIVACY
             container = private_container if cint(is_private) else public_container
@@ -755,9 +761,7 @@ def azure_after_insert(self):
         return
 
     # Build blob key
-    year = datetime.now().year
-    month = datetime.now().strftime("%B")
-    blob_key = f"{year}/{month}/{file_name}"
+    blob_key = _build_blob_key(azure_settings, file_name)
 
     container = (
         azure_settings.private_container_name
