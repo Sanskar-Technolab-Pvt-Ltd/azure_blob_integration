@@ -4,11 +4,13 @@ from frappe.core.doctype.file.file import File
 from frappe.handler import optimize_image, upload_file as core_upload_file
 
 import os
+import re
 import shutil
 from pathlib import Path
 from urllib.parse import urlparse, quote, unquote, unquote_plus, parse_qs
 from azure.storage.blob import BlobServiceClient, generate_blob_sas, BlobSasPermissions
-from azure.core.exceptions import ResourceNotFoundError, ResourceExistsError
+from azure.core import MatchConditions
+from azure.core.exceptions import ResourceNotFoundError, ResourceExistsError, ResourceModifiedError
 from frappe import _
 from frappe.utils import cint
 from frappe.core.doctype.file.utils import update_existing_file_docs   # FIXED
@@ -84,6 +86,30 @@ AZURE_FILE_METHODS = (
 )
 
 
+# ? Reject keys that could escape the blob namespace (client side dot-segment normalisation etc.)
+def _is_safe_blob_key(key):
+    key = key or ""
+    if not key or key.startswith("/") or "\\" in key or "\x00" in key:
+        return False
+    return all(part not in (".", "..") for part in key.split("/"))
+
+
+# ? Is this blob still used by another File (attachment copies share one blob)
+def _is_key_used_by_other_file(file_doc, key):
+    """
+    Attachment copies (create_attachment_copy) point several File records at one blob, and a
+    File URL is user editable, so another File referencing the blob means it is not ours to
+    move or delete.
+    """
+    others = {"name": ["!=", file_doc.name or ""]}
+
+    if frappe.db.count("File", {**others, "content_hash": key}):
+        return True
+
+    # ? over matching (LIKE wildcards inside the key) only makes this safer
+    return bool(frappe.db.count("File", {**others, "file_url": ["like", f"%{quote(key, safe='/')}%"]}))
+
+
 # ? Resolve blob key of a File (content_hash first, then fall back to file_url)
 def _get_blob_key(file_doc, azure_settings):
     """
@@ -91,38 +117,89 @@ def _get_blob_key(file_doc, azure_settings):
     and older files may have it empty, so recover the key from file_url when needed:
       /api/method/<our method>?key=<blob key>&file_name=...
       https://<account>.blob.core.windows.net/<container>/<blob key>
-    Only URLs of our own endpoints / our own storage account and containers are trusted,
-    so an unrelated URL can never make us copy or delete some other blob.
+
+    file_url is user editable (every user can create/edit their own File), so the URL is
+    only trusted when ALL of these hold, otherwise an empty key is returned:
+      - it is a relative URL of our own endpoints, or an https URL of our own storage
+        account and containers
+      - the key is safe (no "..", no leading "/")
+      - no other File references the same blob
     """
     key = (file_doc.content_hash or "").strip()
-    if key:
-        return key
 
-    parsed = urlparse(file_doc.file_url or "")
+    if not key:
+        parsed = urlparse(file_doc.file_url or "")
 
-    if parsed.path.startswith("/api/method/"):
-        if parsed.path[len("/api/method/"):] not in AZURE_FILE_METHODS:
+        if parsed.path.startswith("/api/method/"):
+            if parsed.scheme or parsed.netloc:
+                return ""
+            if parsed.path[len("/api/method/"):] not in AZURE_FILE_METHODS:
+                return ""
+            key = parse_qs(parsed.query).get("key", [""])[0].strip()
+
+        elif parsed.scheme == "https" and parsed.netloc.lower().endswith(".blob.core.windows.net"):
+            account_name, account_key = _get_account_name_key(azure_settings.connection_string)
+            if not account_name or parsed.netloc.split(".")[0].lower() != account_name.lower():
+                return ""
+
+            # ? first path segment is the container, the rest is the blob key
+            container, separator, key = unquote(parsed.path).lstrip("/").partition("/")
+            if container not in (azure_settings.public_container_name, azure_settings.private_container_name):
+                return ""
+            key = key.strip()
+
+        if key and _is_key_used_by_other_file(file_doc, key):
             return ""
-        return parse_qs(parsed.query).get("key", [""])[0].strip()
 
-    if parsed.netloc.lower().endswith(".blob.core.windows.net"):
-        account_name, account_key = _get_account_name_key(azure_settings.connection_string)
-        if not account_name or parsed.netloc.split(".")[0].lower() != account_name.lower():
-            return ""
+    return key if _is_safe_blob_key(key) else ""
 
-        # ? first path segment is the container, the rest is the blob key
-        container, separator, key = unquote(parsed.path).lstrip("/").partition("/")
-        if container not in (azure_settings.public_container_name, azure_settings.private_container_name):
-            return ""
-        return key.strip()
 
-    return ""
+# ? Only Frappe itself (md5 of the content) or this app may write File.content_hash
+CONTENT_HASH_PATTERN = re.compile(r"^[0-9a-f]{32}$")
+
+
+def validate_content_hash_unchanged(doc, method=None):
+    """
+    File.content_hash is the blob key of Azure files and decides who may read, move or delete
+    the blob. It is only read_only in the form, so any user could set it to another user's key
+    through the API. Reject that. Frappe's own hashes (md5 of the content), changes made by this
+    app (flag) and server side attachment copies are allowed.
+    """
+    if doc.is_folder or doc.flags.azure_content_hash_restored or doc.flags.copy_from_existing_file:
+        return
+
+    new_hash = (doc.content_hash or "").strip()
+    if not new_hash or CONTENT_HASH_PATTERN.match(new_hash):
+        return
+
+    if doc.is_new() or doc.has_value_changed("content_hash"):
+        frappe.throw(_("File content hash cannot be changed."), frappe.PermissionError)
 
 
 # ? Is this file_url already served through Azure
 def _is_azure_managed_url(file_url):
     file_url = file_url or ""
     return "/api/method/" in file_url or "blob.core.windows.net" in file_url
+
+
+# ? Delete a blob, never raise (used for clean up)
+def _delete_blob_quietly(blob_client):
+    try:
+        blob_client.delete_blob()
+    except Exception:
+        pass
+
+
+# ? Same size and same MD5 recorded by Azure (names alone never prove two blobs are the same file)
+def _blobs_are_identical(blob_a, blob_b):
+    try:
+        props_a = blob_a.get_blob_properties()
+        props_b = blob_b.get_blob_properties()
+        md5_a = props_a.content_settings.content_md5
+        md5_b = props_b.content_settings.content_md5
+        return bool(md5_a) and md5_a == md5_b and props_a.size == props_b.size
+    except Exception:
+        return False
 
 
 # ? Upload a blob without ever overwriting an existing one
@@ -248,6 +325,20 @@ def _enforce_login_if_required(azure_settings):
         frappe.throw(_("Login is required to access this file."), frappe.PermissionError)
 
 
+# ? Can the current user read any private File that points at this blob
+def _can_read_private_key(key):
+    names = frappe.get_all(
+        "File",
+        filters={"content_hash": key, "is_private": 1},
+        pluck="name",
+        limit=50,
+    )
+    for name in names:
+        if frappe.has_permission("File", doc=frappe.get_doc("File", name), ptype="read"):
+            return True
+    return False
+
+
 # ? Public signed redirect (Guest allowed unless "Require Login to Access Files" is enabled)
 @frappe.whitelist(allow_guest=True)
 def generate_public_file(key=None, file_name=None, download=0):
@@ -261,6 +352,10 @@ def generate_public_file(key=None, file_name=None, download=0):
     # ? normalize incoming key/name (handles %20, +, double-encoding cases)
     key = _normalize_qs_value(key)
     file_name = _normalize_qs_value(file_name)
+
+    # ? never accept keys like "../x" or "/x"
+    if not _is_safe_blob_key(key):
+        raise frappe.PermissionError
 
     # ? allow querystring ?download=1 also
     if not download:
@@ -314,6 +409,10 @@ def generate_private_file(key=None, file_name=None, download=0):
     key = _normalize_qs_value(key)
     file_name = _normalize_qs_value(file_name)
 
+    # ? never accept keys like "../x" or "/x"
+    if not _is_safe_blob_key(key):
+        raise frappe.PermissionError
+
     # ? allow querystring ?download=1 also
     if not download:
         download = frappe.form_dict.get("download") or 0
@@ -321,18 +420,10 @@ def generate_private_file(key=None, file_name=None, download=0):
     if frappe.session.user == "Guest":
         raise frappe.PermissionError
 
-    # ? Permission check using File doc (Frappe-like)
+    # ? Permission check using File doc (Frappe-like): allowed if the user can read ANY private
+    # ? File that uses this blob (attachment copies share one blob)
     try:
-        f = frappe.get_all(
-            "File",
-            filters={"content_hash": key, "is_private": 1},
-            fields=["name"],
-            limit=1
-        )
-        if f:
-            file_doc = frappe.get_doc("File", f[0].name)
-            frappe.has_permission("File", doc=file_doc, ptype="read", throw=True)
-        else:
+        if not _can_read_private_key(key):
             raise frappe.PermissionError
     except Exception:
         raise frappe.PermissionError
@@ -421,14 +512,6 @@ def custom_handle_is_private_changed(self):
             source_blob = blob_service_client.get_blob_client(container=source_container, blob=blob_key)
             target_blob = blob_service_client.get_blob_client(container=target_container, blob=blob_key)
 
-            # ? NEVER OVERWRITE ANOTHER FILE THAT ALREADY HAS THE SAME NAME IN THE TARGET CONTAINER
-            if target_blob.exists():
-                frappe.throw(
-                    _("A file named {0} already exists in the {1} container. Rename one of the files and try again.").format(
-                        blob_key, "private" if cint(self.is_private) else "public"
-                    )
-                )
-
             # ? START COPY - Use SAS URL as source (because public access is disabled)
             sas_source_url = _get_sas_url(
                 connection_string=connection_string,
@@ -438,27 +521,49 @@ def custom_handle_is_private_changed(self):
                 expiry_seconds=300,
                 force_download=1,
             )
-            target_blob.start_copy_from_url(sas_source_url)
 
-            # ? WAIT UNTIL COPY COMPLETES (POLLING STATUS)
-            import time
-            props = target_blob.get_blob_properties()
-            attempts = 0
-            while props.copy.status == "pending":
-                attempts += 1
-                time.sleep(0.3)
-                props = target_blob.get_blob_properties()
-                if attempts > 100:
-                    frappe.throw(_("Azure copy is taking too long. Please try again."))
-
-            if props.copy.status != "success":
-                frappe.throw(_("Azure blob copy failed: {0}").format(props.copy.status))
-
-            # ? DELETE ORIGINAL BLOB
+            # ? CONDITIONAL COPY: fails atomically if the target container already has a blob
+            # ? with this key, so another file is never overwritten
+            created_target = True
             try:
-                source_blob.delete_blob()
-            except ResourceNotFoundError:
-                pass
+                target_blob.start_copy_from_url(
+                    sas_source_url, etag="*", match_condition=MatchConditions.IfMissing
+                )
+            except (ResourceExistsError, ResourceModifiedError):
+                # ? a leftover from an earlier interrupted move is the same file: reuse it
+                if not _blobs_are_identical(source_blob, target_blob):
+                    frappe.throw(
+                        _(
+                            "A different file named {0} already exists in the {1} container, so this file cannot be moved there. Ask an administrator to remove or rename that file in Azure Storage."
+                        ).format(blob_key, "private" if cint(self.is_private) else "public")
+                    )
+                created_target = False
+
+            if created_target:
+                try:
+                    # ? WAIT UNTIL COPY COMPLETES (POLLING STATUS)
+                    import time
+                    props = target_blob.get_blob_properties()
+                    attempts = 0
+                    while props.copy.status == "pending":
+                        attempts += 1
+                        time.sleep(0.3)
+                        props = target_blob.get_blob_properties()
+                        if attempts > 100:
+                            frappe.throw(_("Azure copy is taking too long. Please try again."))
+
+                    if props.copy.status != "success":
+                        frappe.throw(_("Azure blob copy failed: {0}").format(props.copy.status))
+                except Exception:
+                    # ? REMOVE THE PARTIAL COPY (WE CREATED IT), THE ORIGINAL IS UNTOUCHED
+                    _delete_blob_quietly(target_blob)
+                    raise
+
+            # ? KEEP BOTH BLOBS UNTIL THE DATABASE CHANGE IS SAVED:
+            # ?  - saved -> delete the original, rolled back -> delete the copy we made
+            frappe.db.after_commit.add(lambda: _delete_blob_quietly(source_blob))
+            if created_target:
+                frappe.db.after_rollback.add(lambda: _delete_blob_quietly(target_blob))
 
             # ? UPDATE file_url BASED ON PRIVACY
             if cint(self.is_private):
@@ -472,6 +577,7 @@ def custom_handle_is_private_changed(self):
 
             # ? KEEP BLOB KEY SAVED (Frappe may have cleared it, see _get_blob_key)
             self.content_hash = blob_key
+            self.flags.azure_content_hash_restored = True
 
             # ? UPDATE REFERENCE IN ATTACHED DOCTYPES
             update_existing_file_docs(self)
@@ -592,6 +698,10 @@ def custom_on_trash(self):
 
         # ? NOT AN AZURE FILE OF THIS APP / NO KEY TO DELETE - DO NOT BLOCK USER DELETE
         if not blob_key:
+            return
+
+        # ? ANOTHER FILE (ATTACHMENT COPY) STILL USES THIS BLOB - KEEP IT, LIKE FRAPPE DOES FOR LOCAL FILES
+        if _is_key_used_by_other_file(self, blob_key):
             return
 
         if not azure_settings.enable:

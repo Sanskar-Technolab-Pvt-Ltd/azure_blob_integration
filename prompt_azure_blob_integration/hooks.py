@@ -145,6 +145,13 @@ doctype_js = {"File" : "public/js/file.js"}
 # 	}
 # }
 
+# File.content_hash is the Azure blob key, so users must not be able to set it
+doc_events = {
+	"File": {
+		"validate": "prompt_azure_blob_integration.validate_content_hash_unchanged",
+	}
+}
+
 # Scheduled Tasks
 # ---------------
 
